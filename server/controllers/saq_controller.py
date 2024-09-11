@@ -16,26 +16,18 @@ import boto3
 from io import BytesIO
 from openpyxl import load_workbook
 import pandas as pd
-from openpyxl.utils import column_index_from_string
-import spacy
 
 load_dotenv()
 
-
 # -- FUNCTION TO RETRIEVE QUESTIONS FROM QUESTION S3 BUCKET --
-def get_questions_from_excel(file_details, bucket_name, prefix, previous_questionnaire: bool):
+def get_questions_from_excel(file_details, bucket_name, prefix):
     # Initialize S3 client
     s3 = boto3.client('s3')
 
     # Extract file name and sheet details from the input parameter
     file_name = file_details["file_name"]
-    question_sheet_details = []
-    if(previous_questionnaire):
-        question_sheet_details = file_details["previous_question_sheet_details"]
-    else:
-        question_sheet_details = file_details["question_sheet_details"]
+    question_sheet_details = file_details["question_sheet_details"]
 
-        
     # List the files in the S3 bucket
     response = s3.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
 
@@ -69,67 +61,63 @@ def get_questions_from_excel(file_details, bucket_name, prefix, previous_questio
     # Iterate through the provided sheet details
     for sheet_detail in question_sheet_details:
         sheet_name = sheet_detail["sheet_name"]
-        question_column = sheet_detail["question_column"]  # This is a letter like "A", "B", etc.
-        answer_column = sheet_detail.get("answer_column")  # This is also a letter like "B", "C", etc.
+        question_column = sheet_detail["question_column"]
+        answer_column = sheet_detail.get("answer_column")
 
         # Check if the sheet exists in the workbook
         if sheet_name not in wb.sheetnames:
             print(f"Sheet {sheet_name} not found in the workbook. Skipping.")
             continue
 
-        ws = wb[sheet_name]
+        df = pd.read_excel(file_stream, sheet_name=sheet_name)
 
-        # Convert the column letters to indices (1-based, so subtract 1 for 0-based indexing)
-        question_col_idx = column_index_from_string(question_column) - 1
-        answer_col_idx = column_index_from_string(answer_column) - 1 if answer_column else None
+        # Check if the question column exists in the sheet
+        if question_column not in df.columns:
+            print(f"Question column {question_column} not found in sheet {sheet_name}. Skipping.")
+            continue
 
-        # Iterate over the rows of the sheet and extract questions and answers
-        for row in ws.iter_rows(min_row=2, values_only=True):  # Start from row 2 to skip headers
-            question = row[question_col_idx]
-            answer = row[answer_col_idx] if answer_col_idx is not None else ""
+        # Check if the answer column exists in the sheet (if provided)
+        answer_column_exists = answer_column in df.columns if answer_column else False
 
-            if question:  # Ensure that question is not empty
-                extracted_data.append({"question": question, "answer": answer})
+        # Extract data from the question column
+        for index, question in df[question_column].dropna().iteritems():
+            answer = df[answer_column][index] if answer_column_exists else ""
+            extracted_data.append({"question": question, "answer": answer})
 
     print('Extracted data:', extracted_data)
     return extracted_data
 
 # -- FUNCTION THAT UPDATES LIST BASED ON SIMILARITY SEARCH --
-def match_and_update_answers(list_one: list, list_two: list, similarity_threshold: float = 0.7):
-    # Load the spaCy model with word vectors
-    nlp = spacy.load("en_core_web_md")  # or "en_core_web_lg" for larger models
+def match_and_update_answers(list_one: list, list_two: list, similarity_threshold: float = 0.8):
+    # Load the model
+    model = SentenceTransformer("all-MiniLM-L6-v2")
+
+    # Extract questions from both lists
+    questions_one = [item['question'] for item in list_one]
+    questions_two = [item['question'] for item in list_two]
+
+    # Perform paraphrase mining to find similar questions
+    paraphrases = util.paraphrase_mining(model, questions_one + questions_two)
 
     # Create a mapping from questions to their corresponding answers in list_two
     question_to_answer = {item['question']: item['answer'] for item in list_two}
 
-    # Iterate over each question in list_one
-    for i, item_one in enumerate(list_one):
-        max_similarity = 0
-        best_match_answer = None
-        
-        # Convert the current question in list_one to a spaCy Doc object
-        question_one = nlp(item_one['question'])
+    # Iterate over the found paraphrases and update answers in list_one
+    for paraphrase in paraphrases:
+        score, i, j = paraphrase
 
-        # Compare it with every question in list_two
-        for item_two in list_two:
-            # Convert the current question in list_two to a spaCy Doc object
-            question_two = nlp(item_two['question'])
-
-            # Compute the similarity score
-            similarity_score = question_one.similarity(question_two)
-
-            # If the similarity score is above the threshold and higher than the previous best match
-            if similarity_score >= similarity_threshold and similarity_score > max_similarity:
-                max_similarity = similarity_score
-                best_match_answer = item_two['answer']
-
-        # If a similar question was found, update the answer in list_one
-        if best_match_answer:
-            list_one[i]['answer'] = best_match_answer
+        # Ensure that the similarity is above the threshold
+        if score >= similarity_threshold:
+            if i < len(list_one) and j >= len(list_one):
+                # Match found where i is in list_one and j is in list_two
+                list_one[i]['answer'] = question_to_answer[questions_two[j - len(list_one)]]
+            elif j < len(list_one) and i >= len(list_one):
+                # Match found where j is in list_one and i is in list_two
+                list_one[j]['answer'] = question_to_answer[questions_two[i - len(list_one)]]
 
     return list_one
 
-
+# -- FUNCTION TO UPDATE ANSWERS TO EXCEL --
 def update_excel_and_save_to_s3(file_details, bucket_name, prefix, qa_list):
     # Initialize S3 client
     s3 = boto3.client('s3')
@@ -168,8 +156,8 @@ def update_excel_and_save_to_s3(file_details, bucket_name, prefix, qa_list):
     # Iterate through the provided sheet details
     for sheet_detail in question_sheet_details:
         sheet_name = sheet_detail["sheet_name"]
-        question_column = sheet_detail["question_column"]  # Position like "A", "B", etc.
-        answer_column = sheet_detail["answer_column"]  # Position like "B", "C", etc.
+        question_column = sheet_detail["question_column"]
+        answer_column = sheet_detail["answer_column"]
 
         # Check if the sheet exists in the workbook
         if sheet_name not in wb.sheetnames:
@@ -177,23 +165,30 @@ def update_excel_and_save_to_s3(file_details, bucket_name, prefix, qa_list):
             continue
 
         ws = wb[sheet_name]
+        df = pd.read_excel(file_stream, sheet_name=sheet_name)
 
-        # Convert column letters to indices (1-based, subtract 1 for 0-based indexing)
-        question_col_idx = column_index_from_string(question_column)
-        answer_col_idx = column_index_from_string(answer_column)
+        # Check if the question and answer columns exist in the sheet
+        if question_column not in df.columns:
+            print(f"Question column {question_column} not found in sheet {sheet_name}. Skipping.")
+            continue
 
-        # Iterate through rows to find the matching question and update the answer
-        for row in ws.iter_rows(min_row=2, max_row=ws.max_row):  # Skipping header row
-            row_question = row[question_col_idx - 1].value  # 1-based index to 0-based
-            for qa_item in qa_list:
-                if row_question == qa_item["question"]:
-                    # Update the answer in the corresponding answer column
-                    ws.cell(row=row[0].row, column=answer_col_idx, value=qa_item["answer"])
-                    break
+        if answer_column not in df.columns:
+            print(f"Answer column {answer_column} not found in sheet {sheet_name}. Skipping.")
+            continue
+
+        # Update the answer column in the Excel sheet for matching questions
+        for qa_item in qa_list:
+            question = qa_item["question"]
+            answer = qa_item["answer"]
+            # Find the row where the question matches
+            match_index = df[df[question_column] == question].index
+            if not match_index.empty:
+                # Write the answer to the corresponding cell in the Excel sheet
+                ws[f"{answer_column}{match_index[0] + 2}"] = answer
 
     # Save the updated workbook back to S3
     save_to_s3(wb, bucket_name, file_key)
-    
+
 def save_to_s3(workbook, bucket_name, file_key):
     # Save the workbook to a BytesIO object
     output_stream = BytesIO()
@@ -212,19 +207,18 @@ def save_to_s3(workbook, bucket_name, file_key):
     print('Wrote to S3')
 
 async def security_assesment_questionnaire_result(user_id: str, req_id: str, previous_question_details: List[dict], question_details: List[dict]):
-    print('start')
-    bucket_name = 'prestage-ofofo-storage'
+
+    bucket_name = 'ofofo-stage-storage'
     prefix = 'questionnaire/query/' + user_id + '/' + req_id + '/'
-    print('start')
-    question_list = get_questions_from_excel(question_details, bucket_name, prefix, False)
-    print('start')
-    prefix = 'questionnaire/previouslyAnsweredQuestionnaire/' + user_id + '/' + req_id + '/'
-    question_answer_list = get_questions_from_excel(previous_question_details, bucket_name, prefix, True)
-    print('start')
-    question_list_updated = match_and_update_answers(question_list, question_answer_list)
-    print('UPDATED ::::::')
-    print(question_list_updated)
-    prefix = 'questionnaire/query/' + user_id + '/' + req_id + '/'
-    update_excel_and_save_to_s3(question_details, bucket_name, prefix, question_list_updated)
-    print('start')
+
+    question_list = get_questions_from_excel(question_details, bucket_name, prefix)
+
+    # prefix = 'questionnaire/previouslyAnsweredQuestionnaire' + user_id + '/' + req_id + '/'
+    # question_answer_list = get_questions_from_excel(previous_question_details, bucket_name, prefix)
+
+    # question_list_updated = match_and_update_answers(question_list, question_answer_list)
+
+    # prefix = 'questionnaire/results' + user_id + '/' + req_id + '/'
+    # update_excel_and_save_to_s3(question_details, bucket_name, prefix, question_list_updated)
+
     return {"message": "you"}

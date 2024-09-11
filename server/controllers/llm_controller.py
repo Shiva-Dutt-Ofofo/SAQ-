@@ -20,6 +20,7 @@ import requests
 import boto3
 from io import BytesIO
 from openpyxl import load_workbook
+import pandas as pd
 
 # -- DATA CLEANING & OS OPERATIONS --
 import re
@@ -35,7 +36,6 @@ load_dotenv()
 # -- FUNCTIONS --
 
 # -- NEWER CREATE RETRIEVAL CHAIN SETUP --
-
 def new_retrieval_chain(vector_database, input_query: str):
 
     # repo_id = "meta-llama/Meta-Llama-3.1-8B-Instruct"
@@ -73,6 +73,8 @@ def new_retrieval_chain(vector_database, input_query: str):
     response = rag_chain.invoke({"input": input_query})
     return response["answer"]
     # print(response["context"])
+
+
 
 def remove_semantic_duplicates(sentences: list):
 

@@ -26,6 +26,7 @@ import pandas as pd
 import boto3
 from io import BytesIO
 from openpyxl import load_workbook
+from docx import Document
 
 # -- DATA CLEANING OPERATIONS IMPORTS --
 import re
@@ -406,6 +407,80 @@ def save_to_s3(workbook, bucket_name, file_key):
     s3.put_object(Bucket=bucket_name, Key=file_key_str, Body=output_stream)
     print('wrote to s3')
 
+# -- DOCX WRITING FUNCTIONS --
+
+def update_document_with_answers(doc, sentences, strings_list, threshold=0.7):
+    """Update the document by appending answers to sentences that match with strings in the result list."""
+    model = SentenceTransformer("all-MiniLM-L6-v2")
+    
+    # Encode all the sentences and strings for comparison
+    sentence_embeddings = model.encode(sentences, convert_to_tensor=True)
+    string_embeddings = model.encode(strings_list, convert_to_tensor=True)
+    
+    for idx, sentence in enumerate(sentences):
+        # Compute cosine similarities between the current sentence and all strings
+        similarities = util.cos_sim(sentence_embeddings[idx], string_embeddings)
+        max_similarity, max_index = torch.max(similarities, dim=1)
+        
+        if max_similarity.item() >= threshold:
+            matching_string = strings_list[max_index.item()]
+            answer = extract_answer(matching_string)  # Extract only the answer part
+            if answer:
+                # Append the answer in a new line after the sentence
+                doc.paragraphs[idx].add_run(f'\nAnswer: {answer}')
+
+def process_word_file(idx, strings_list, bucket_name, prefix):
+
+    # Initialize S3 client
+    s3 = boto3.client('s3')
+
+    # List the files in the S3 bucket
+    response = s3.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
+
+    # Filter the files to only include Word documents
+    word_files = [item['Key'] for item in response.get('Contents', []) if item['Key'].endswith('.docx')]
+
+    file_key = word_files[idx]
+    print(file_key)
+    
+    # Download the file to a BytesIO object
+    file_stream = BytesIO()
+    s3.download_fileobj(bucket_name, file_key, file_stream)
+
+    # Seek to the beginning of the BytesIO object
+    file_stream.seek(0)
+
+    # Load the Word document
+    doc = Document(file_stream)
+
+    # Extract all sentences from the document
+    sentences = [paragraph.text for paragraph in doc.paragraphs if paragraph.text]
+
+    # Update the document with answers
+    update_document_with_answers(doc, sentences, strings_list)
+
+    print('Updated Word document')
+
+    # Save the updated document back to the Word file in S3
+    save_word_to_s3(doc, bucket_name, file_key)
+
+def save_word_to_s3(document, bucket_name, file_key):
+    # Save the document to a BytesIO object
+    output_stream = BytesIO()
+    document.save(output_stream)
+    output_stream.seek(0)
+
+    # Modify the file key to indicate the result folder
+    file_key_list = file_key.split('/')
+    file_key_list[1] = 'result'
+    file_key_str = '/'.join(file_key_list)
+    print(file_key_str)
+    
+    # Upload the file back to S3
+    s3 = boto3.client('s3')
+    s3.put_object(Bucket=bucket_name, Key=file_key_str, Body=output_stream)
+    print('Uploaded to S3')
+
 
 async def retrieval_llama(user_id, req_id):
     #import nltk
@@ -489,6 +564,7 @@ async def retrieval_llama(user_id, req_id):
 
         # write_to_s3_folder(bucket_name, result_folder_name, result_file_name, result)
         process_excel_file(idx, result_list, bucket_name, prefix)
+        process_word_file(idx, result_list, bucket_name, prefix)
         
         print("results written to s3..!")
         print(idx, 'Index name')
